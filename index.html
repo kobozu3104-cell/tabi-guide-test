@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>同乗ガイド 試作</title>
+<style>
+  :root { --bg:#faf8f4; --fg:#222; --sub:#666; --line:#ddd; --ok:#1f7a3f; --ng:#b3261e; --btn:#2b4c7e; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:12px 16px 40px; background:var(--bg); color:var(--fg);
+         font-family: "Noto Sans JP", "Yu Gothic UI", sans-serif; font-size:17px; line-height:1.5; }
+  h1 { font-size:20px; margin:4px 0 10px; }
+  .note { color:var(--sub); font-size:14px; margin:0 0 10px; }
+  button { font:inherit; font-size:18px; padding:14px 10px; border:0; border-radius:10px;
+           background:var(--btn); color:#fff; width:100%; margin:6px 0; }
+  button.sub { background:#fff; color:var(--btn); border:2px solid var(--btn); }
+  button:disabled { opacity:.4; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin:10px 0; }
+  .stat { display:grid; grid-template-columns: 9em 1fr; gap:2px 8px; font-size:16px; }
+  .stat b { font-weight:600; }
+  .ok { color:var(--ok); font-weight:700; }
+  .ng { color:var(--ng); font-weight:700; }
+  select, input { font:inherit; font-size:16px; padding:8px; width:100%; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  label { font-size:14px; color:var(--sub); display:block; margin-top:6px; }
+  #log { font-size:14px; max-height:260px; overflow-y:auto; }
+  #log div { border-bottom:1px solid #eee; padding:3px 0; }
+  ul.pts { margin:4px 0; padding-left:1.2em; font-size:15px; }
+</style>
+</head>
+<body>
+<h1>同乗ガイド 試作（画面分割テスト）</h1>
+<p class="note">Googleマップと並べて、ガイドが話し続けられるかを確かめるための試作です。場所の情報はこのスマホの中だけで使い、どこにも送りません。</p>
+
+<button id="startBtn">① はじめる</button>
+
+<div class="card stat">
+  <span>状態</span><b id="sState">まだ始めていません</b>
+  <span>GPSの更新</span><b id="sCount">0 回</b>
+  <span>最後の更新</span><b id="sLast">―</b>
+  <span>精度</span><b id="sAcc">―</b>
+  <span>出発から</span><b id="sDist">―</b>
+  <span>画面つけっぱなし</span><b id="sWake">―</b>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button id="testVoiceBtn" class="sub">声をためす</button>
+    <button id="stopBtn" class="sub">静かに</button>
+  </div>
+  <label for="voiceSel">声</label>
+  <select id="voiceSel"></select>
+  <label for="rateSel">話す速さ</label>
+  <select id="rateSel">
+    <option value="0.8">ゆっくり</option>
+    <option value="0.9" selected>少しゆっくり</option>
+    <option value="1.0">ふつう</option>
+  </select>
+  <label for="beatSel">ときどきのひと声（「順調ですね」など）</label>
+  <select id="beatSel">
+    <option value="0">なし</option>
+    <option value="60000">1分ごと</option>
+    <option value="120000" selected>2分ごと</option>
+    <option value="300000">5分ごと</option>
+  </select>
+</div>
+
+<div class="card">
+  <b>地点を登録して試す（任意）</b>
+  <p class="note">今いる場所を登録すると、あとでそこに近づいたときに声で知らせます。</p>
+  <label for="radiusSel">知らせる距離</label>
+  <select id="radiusSel">
+    <option value="200">200m 以内</option>
+    <option value="300" selected>300m 以内</option>
+    <option value="500">500m 以内</option>
+  </select>
+  <button id="addPtBtn" class="sub">今いる場所を登録</button>
+  <ul class="pts" id="ptList"></ul>
+  <button id="clearPtBtn" class="sub">登録した地点をぜんぶ消す</button>
+</div>
+
+<div class="card">
+  <b>記録</b>
+  <div id="log"></div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const STORE = 'tabiGuideShisaku.points';
+  let watchId = null, count = 0, lastPos = null, startPos = null;
+  let nextKm = 0.5, wakeLock = null, beatTimer = null, beatNo = 0, startedAt = 0, voices = [];
+  let points = [];
+  try { points = JSON.parse(localStorage.getItem(STORE) || '[]'); } catch (e) { points = []; }
+
+  const hhmm = d => d.toTimeString().slice(0, 8);
+  function log(msg) {
+    const el = document.createElement('div');
+    el.textContent = hhmm(new Date()) + '　' + msg;
+    $('log').prepend(el);
+  }
+  function savePoints() {
+    try { localStorage.setItem(STORE, JSON.stringify(points)); } catch (e) {}
+    renderPoints();
+  }
+  function renderPoints() {
+    $('ptList').innerHTML = '';
+    points.forEach(p => {
+      const li = document.createElement('li');
+      li.textContent = p.name + '（' + p.radius + 'm）' + (p.done ? '　済み' : '');
+      $('ptList').append(li);
+    });
+  }
+
+  // 距離（メートル）
+  function dist(a, b) {
+    const R = 6371000, rad = x => x * Math.PI / 180;
+    const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+
+  // 声
+  function loadVoices() {
+    voices = speechSynthesis.getVoices().filter(v => v.lang && v.lang.replace('_', '-').startsWith('ja'));
+    const sel = $('voiceSel'), keep = sel.value;
+    sel.innerHTML = '';
+    if (!voices.length) {
+      sel.innerHTML = '<option value="">（日本語の声が見つかりません）</option>';
+      return;
+    }
+    voices.forEach((v, i) => {
+      const o = document.createElement('option');
+      o.value = i;
+      o.textContent = v.name;
+      sel.append(o);
+    });
+    if (keep) sel.value = keep;
+  }
+  speechSynthesis.onvoiceschanged = loadVoices;
+  loadVoices();
+
+  function say(text) {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ja-JP';
+    u.rate = Number($('rateSel').value);
+    const v = voices[Number($('voiceSel').value)];
+    if (v) u.voice = v;
+    speechSynthesis.speak(u);
+    log('話した：' + text);
+  }
+
+  // 画面つけっぱなし
+  async function keepAwake() {
+    if (!('wakeLock' in navigator)) { $('sWake').innerHTML = '<span class="ng">このスマホでは使えません</span>'; return; }
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      $('sWake').innerHTML = '<span class="ok">オン</span>';
+      wakeLock.addEventListener('release', () => { $('sWake').innerHTML = '<span class="ng">オフ</span>'; });
+    } catch (e) {
+      $('sWake').innerHTML = '<span class="ng">できませんでした</span>';
+    }
+  }
+
+  function onPos(pos) {
+    count++;
+    const p = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+    lastPos = p;
+    if (!startPos) { startPos = p; log('出発地点を記録しました'); }
+    $('sCount').textContent = count + ' 回';
+    $('sLast').textContent = hhmm(new Date());
+    $('sAcc').textContent = '約 ' + Math.round(pos.coords.accuracy) + ' m';
+    const km = dist(startPos, p) / 1000;
+    $('sDist').textContent = km.toFixed(2) + ' km';
+    $('sState').innerHTML = '<span class="ok">場所を追っています</span>';
+
+    // 出発地点から 0.5km、1km、2km、3km… と離れたら知らせる
+    if (km >= nextKm) {
+      say('出発地点から' + (nextKm < 1 ? '500メートル' : nextKm + 'キロ') + '進みました。');
+      nextKm = nextKm < 1 ? 1 : Math.floor(km) + 1;
+    }
+    // 登録した地点に近づいたら知らせる
+    points.forEach(pt => {
+      if (!pt.done && dist(pt, p) <= pt.radius) {
+        pt.done = true;
+        savePoints();
+        say(pt.name + 'に近づきました。');
+      }
+    });
+  }
+  function onErr(err) {
+    const msg = { 1: '位置情報の使用が許可されていません', 2: '場所がわかりません', 3: '時間切れ' }[err.code] || err.message;
+    $('sState').innerHTML = '<span class="ng">' + msg + '</span>';
+    log('GPSエラー：' + msg);
+  }
+
+  function startBeat() {
+    clearInterval(beatTimer);
+    const ms = Number($('beatSel').value);
+    if (!ms || watchId === null) return;
+    beatTimer = setInterval(() => {
+      const mins = Math.round((Date.now() - startedAt) / 60000);
+      const lines = [
+        '順調ですね。出発して' + mins + '分になりました。',
+        '道中、安全運転でいきましょう。',
+        'いい調子です。このまま気をつけて進みましょう。',
+        '出発して' + mins + '分。疲れたら、無理せず休憩しましょうね。',
+        'ゆっくりで大丈夫です。景色も楽しんでいきましょう。'
+      ];
+      say(lines[beatNo++ % lines.length]);
+      log('（GPSの更新は' + count + '回）');
+    }, ms);
+  }
+
+  $('startBtn').onclick = () => {
+    if (!('geolocation' in navigator)) { onErr({ code: 0, message: 'このブラウザではGPSが使えません' }); return; }
+    if (watchId !== null) return;
+    watchId = navigator.geolocation.watchPosition(onPos, onErr, { enableHighAccuracy: true, maximumAge: 5000, timeout: 30000 });
+    startedAt = Date.now();
+    $('startBtn').textContent = '動いています';
+    $('startBtn').disabled = true;
+    $('sState').textContent = '場所を探しています…';
+    keepAwake();
+    say('それでは出発しましょう。今日もよろしくお願いします。');
+    startBeat();
+  };
+  $('testVoiceBtn').onclick = () => say('愛知県に入りました。ちなみに、このあたりは栗きんとんが名物です。');
+  $('stopBtn').onclick = () => { speechSynthesis.cancel(); log('静かにしました'); };
+  $('beatSel').onchange = startBeat;
+  $('addPtBtn').onclick = () => {
+    if (!lastPos) { alert('先に「はじめる」を押して、場所がわかるまで待ってください。'); return; }
+    const name = '地点' + (points.length + 1);
+    points.push({ name, lat: lastPos.lat, lng: lastPos.lng, radius: Number($('radiusSel').value), done: true });
+    savePoints();
+    log(name + 'を登録しました（今いる場所なので、一度離れてから戻ると知らせます）');
+  };
+  $('clearPtBtn').onclick = () => { if (confirm('登録した地点をぜんぶ消しますか？')) { points = []; savePoints(); log('地点を消しました'); } };
+
+  // 登録した地点：離れたら「済み」を外して、また近づいたときに知らせる
+  setInterval(() => {
+    if (!lastPos) return;
+    let changed = false;
+    points.forEach(pt => { if (pt.done && dist(pt, lastPos) > pt.radius * 2) { pt.done = false; changed = true; } });
+    if (changed) savePoints();
+  }, 5000);
+
+  document.addEventListener('visibilitychange', () => {
+    log(document.visibilityState === 'visible' ? '画面に表示されました' : '画面から隠れました（裏に回った）');
+    if (document.visibilityState === 'visible' && watchId !== null && (!wakeLock || wakeLock.released)) keepAwake();
+  });
+
+  renderPoints();
+})();
+</script>
+</body>
+</html>
